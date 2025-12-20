@@ -19,11 +19,3 @@ Set the following secrets in your Cloudflare Dashboard or `.dev.vars` file:
 | :--- | :--- |
 | `NOTION_API_KEY` | Your Notion Integration Internal Secret (`secret_...`) |
 | `NOTION_DATABASE_ID` | The ID of the database containing the portfolio items |
-
-## 🔌 API Endpoints
-
-### 1. Get Portfolio Data
-Returns the transformed list of projects.
-
-```http
-GET /
