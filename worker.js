@@ -1,205 +1,360 @@
-/**
- * Cloudflare Worker: Notion API Proxy + S3 Image Caching Gateway
- */
+// ============================================
+// 优化版 Cloudflare Worker - R2 图片缓存方案
+// ============================================
+
 export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-
-    // --- Router Dispatch ---
-    // 1. If path is /image, handle image proxy logic (Aggressive Caching)
-    if (url.pathname === "/image") {
-      return handleImageProxy(request, ctx);
-    }
-
-    // 2. Otherwise, default to Notion JSON logic (Short-term Caching)
-    return handleJsonRequest(request, env, ctx);
-  },
-};
-
-// ==========================================
-// Logic A: Image Proxy (Proxy & Smart Cache)
-// ==========================================
-async function handleImageProxy(request, ctx) {
-  const url = new URL(request.url);
-  const targetUrl = url.searchParams.get("url"); // The actual Notion S3 URL
-  const blockId = url.searchParams.get("blockId"); // Stable identifier (Notion Block/Page UUID)
-
-  // Validate parameters
-  if (!targetUrl || !blockId) {
-    return new Response("Missing 'url' or 'blockId' parameter", { status: 400 });
-  }
-
-  // 1. Check Cache (Cloudflare Edge Cache)
-  const cache = caches.default;
-
-  // [OPTIMIZATION]: Construct a stable Cache Key using blockId.
-  // We ignore the 'targetUrl' for caching because it contains expiring signatures.
-  // The cache key effectively becomes: https://api.domain.com/image/{UUID}
-  const cacheKey = new Request(new URL(`https://${url.hostname}/image/${blockId}`), request);
-  
-  let response = await cache.match(cacheKey);
-
-  if (response) {
-    const newRes = new Response(response.body, response);
-    newRes.headers.set("X-Image-Cache", "HIT");
-    // Ensure CORS headers are present even on cache hit
-    newRes.headers.set("Access-Control-Allow-Origin", "*");
-    return newRes;
-  }
-
-  // 2. Cache Miss: Fetch from Origin (Notion/S3)
-  const imageResponse = await fetch(targetUrl, {
-    headers: {
-      "User-Agent": "Cloudflare-Worker" // Polite behavior
-    }
-  });
-
-  // If S3 link is expired or invalid, pass the error through
-  if (!imageResponse.ok) {
-    return imageResponse;
-  }
-
-  // 3. Header Cleaning & Reassembly
-  const newHeaders = new Headers(imageResponse.headers);
-
-  // Remove restrictive S3 headers
-  newHeaders.delete("x-amz-request-id");
-  newHeaders.delete("x-amz-id-2");
-  newHeaders.delete("set-cookie"); 
-  newHeaders.delete("expires");
-  
-  // Force Cache-Control
-  // Browser: 1 year (immutable) - The browser will never ask again for this URL
-  // Cloudflare Edge: 1 year (s-maxage)
-  newHeaders.set("Cache-Control", "public, max-age=31536000, s-maxage=31536000, immutable");
-  newHeaders.set("CDN-Cache-Control", "max-age=31536000");
-  newHeaders.set("X-Image-Cache", "MISS");
-  newHeaders.set("Access-Control-Allow-Origin", "*"); // Enable CORS
-
-  // 4. Rebuild Response and Write to Cache
-  response = new Response(imageResponse.body, {
-    status: imageResponse.status,
-    statusText: imageResponse.statusText,
-    headers: newHeaders,
-  });
-
-  // Write to cache using the STABLE cacheKey (based on blockId)
-  ctx.waitUntil(cache.put(cacheKey, response.clone()));
-
-  return response;
+async fetch(request, env) {
+// CORS 处理
+if (request.method === ‘OPTIONS’) {
+return new Response(null, {
+headers: {
+‘Access-Control-Allow-Origin’: ‘*’,
+‘Access-Control-Allow-Methods’: ‘GET, POST, OPTIONS’,
+‘Access-Control-Allow-Headers’: ‘Content-Type’,
+},
+});
 }
 
-// ==========================================
-// Logic B: Notion JSON Data Aggregation
-// ==========================================
-async function handleJsonRequest(request, env, ctx) {
-  const CACHE_TTL = 60; // Cache JSON for only 60 seconds to ensure freshness
-  const corsHeaders = {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+```
+const url = new URL(request.url);
+
+try {
+  // 路由
+  if (url.pathname === '/api/collections') {
+    return await handleCollections(env);
+  } else if (url.pathname.startsWith('/api/collection/')) {
+    const collectionId = url.pathname.split('/').pop();
+    return await handleCollectionDetail(collectionId, env);
+  } else if (url.pathname.startsWith('/images/')) {
+    // 直接从 R2 返回图片
+    return await handleImageRequest(url.pathname, env);
+  }
+
+  return new Response('Not Found', { status: 404 });
+} catch (error) {
+  console.error('Error:', error);
+  return new Response(JSON.stringify({ error: error.message }), {
+    status: 500,
+    headers: { 
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+    },
+  });
+}
+```
+
+},
+};
+
+// ============================================
+// 图片处理：从 R2 返回或代理
+// ============================================
+
+async function handleImageRequest(pathname, env) {
+const key = pathname.substring(1); // 去掉开头的 /
+
+try {
+const object = await env.PHOTO_BUCKET.get(key);
+
+```
+if (!object) {
+  return new Response('Image not found', { status: 404 });
+}
+
+return new Response(object.body, {
+  headers: {
+    'Content-Type': object.httpMetadata?.contentType || 'image/jpeg',
+    'Cache-Control': 'public, max-age=31536000, immutable',
+    'Access-Control-Allow-Origin': '*',
+  },
+});
+```
+
+} catch (error) {
+console.error(‘R2 error:’, error);
+return new Response(‘Error fetching image’, { status: 500 });
+}
+}
+
+// ============================================
+// 获取所有系列（优化版）
+// ============================================
+
+async function handleCollections(env) {
+const CACHE_KEY = ‘collections:all:v2’;
+const CACHE_TTL = 300; // 5分钟
+
+// 1. 检查 KV 缓存
+const cached = await env.CACHE_KV?.get(CACHE_KEY, ‘json’);
+if (cached) {
+console.log(‘✅ Cache hit for collections’);
+return jsonResponse(cached, { ‘X-Cache’: ‘HIT’ });
+}
+
+console.log(‘⚠️ Cache miss, fetching from Notion…’);
+
+// 2. 查询 Notion 数据库
+const response = await notionQuery(env.NOTION_DATABASE_ID, env.NOTION_TOKEN);
+
+// 3. 并行获取所有页面详情
+const pageDetailsPromises = response.results.map(result =>
+getPageDetails(result.id, env.NOTION_TOKEN).catch(err => {
+console.error(`❌ Failed to get page ${result.id}:`, err);
+return null;
+})
+);
+
+const allPageDetails = await Promise.all(pageDetailsPromises);
+
+// 4. 并行处理图片到 R2
+const collections = await Promise.all(
+response.results.map(async (result, index) => {
+const pageDetails = allPageDetails[index];
+if (!pageDetails) return null;
+
+```
+  const properties = result.properties;
+  const images = extractImages(pageDetails);
+
+  // 并行缓存所有图片到 R2
+  const [coverUrl, ...imageUrls] = await Promise.all([
+    cacheImageToR2(images[0]?.url, `${result.id}-cover`, env),
+    ...images.slice(0, 3).map((img, i) => 
+      cacheImageToR2(img.url, `${result.id}-preview-${i}`, env)
+    )
+  ]);
+
+  return {
+    id: result.id,
+    title: properties.Name?.title?.[0]?.plain_text || 'Untitled',
+    subtitle: properties.Subtitle?.rich_text?.[0]?.plain_text || '',
+    location: properties.Location?.rich_text?.[0]?.plain_text || '',
+    year: properties.Year?.number || new Date().getFullYear(),
+    description: properties.Description?.rich_text?.[0]?.plain_text || '',
+    count: images.length,
+    cover: coverUrl,
+    previewImages: imageUrls.filter(Boolean),
   };
+})
+```
 
-  // Handle CORS preflight
-  if (request.method === "OPTIONS") {
-    return new Response(null, { headers: corsHeaders });
-  }
+);
 
-  try {
-    const cache = caches.default;
-    const cacheUrl = new URL(request.url);
-    const cacheKey = new Request(cacheUrl.toString(), request);
+const validCollections = collections.filter(Boolean);
 
-    // Check JSON Cache
-    let response = await cache.match(cacheKey);
-    if (response) {
-      const newRes = new Response(response.body, response);
-      newRes.headers.set("X-JSON-Cache", "HIT");
-      return newRes;
-    }
+// 5. 存入 KV 缓存
+if (env.CACHE_KV) {
+await env.CACHE_KV.put(CACHE_KEY, JSON.stringify(validCollections), {
+expirationTtl: CACHE_TTL,
+});
+}
 
-    if (!env.NOTION_API_KEY || !env.NOTION_DATABASE_ID) {
-      throw new Error("Missing environment variables");
-    }
+return jsonResponse(validCollections, {
+‘X-Cache’: ‘MISS’,
+‘Cache-Control’: `public, max-age=${CACHE_TTL}`,
+});
+}
 
-    // Fetch from Notion API
-    const notionUrl = `https://api.notion.com/v1/databases/${env.NOTION_DATABASE_ID}/query`;
-    const notionResponse = await fetch(notionUrl, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${env.NOTION_API_KEY}`,
-        "Notion-Version": "2022-06-28",
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        sorts: [{ property: "SortOrder", direction: "ascending" }],
-      }),
-    });
+// ============================================
+// 获取单个系列详情
+// ============================================
 
-    if (!notionResponse.ok) {
-      throw new Error(`Notion API Error: ${notionResponse.status}`);
-    }
+async function handleCollectionDetail(collectionId, env) {
+const CACHE_KEY = `collection:${collectionId}:v2`;
+const CACHE_TTL = 600; // 10分钟
 
-    const data = await notionResponse.json();
-    const workerOrigin = new URL(request.url).origin; // e.g. https://api.minzhangphoto.com
+// 检查缓存
+const cached = await env.CACHE_KV?.get(CACHE_KEY, ‘json’);
+if (cached) {
+console.log(`✅ Cache hit for collection ${collectionId}`);
+return jsonResponse(cached, { ‘X-Cache’: ‘HIT’ });
+}
 
-    // --- ETL Data Transformation ---
-    const cleanData = data.results.map((page, index) => {
-      const props = page.properties;
-      const pageId = page.id; // Stable UUID from Notion
-      
-      const getName = (p) => p?.title?.[0]?.plain_text || "Untitled";
-      const getText = (p) => p?.rich_text?.[0]?.plain_text || "";
+console.log(`⚠️ Cache miss for collection ${collectionId}`);
 
-      // [Updated]: URL Rewrite Logic
-      const getImages = (prop) => {
-        if (!prop || !prop.files) return [];
-        return prop.files.map((item) => {
-          let rawUrl = null;
-          if (item.type === 'file') rawUrl = item.file.url;
-          else if (item.type === 'external') rawUrl = item.external.url;
-          
-          if (!rawUrl) return null;
+// 获取 Notion 页面
+const [pageInfo, pageDetails] = await Promise.all([
+getPageInfo(collectionId, env.NOTION_TOKEN),
+getPageDetails(collectionId, env.NOTION_TOKEN),
+]);
 
-          // *CORE CHANGE*: Wrap S3 URL into Worker Proxy URL with blockId
-          // Result: https://api.../image?url=encodedUrl&blockId=UUID
-          return `${workerOrigin}/image?url=${encodeURIComponent(rawUrl)}&blockId=${pageId}`;
-        }).filter(Boolean);
-      };
+const properties = pageInfo.properties;
+const allImages = extractImages(pageDetails);
 
-      const title = getName(props.name || props.Name);
-      const location = getText(props.Location || props.location);
-      const images = getImages(props.images || props.Images);
-      const cover = images.length > 0 ? images[0] : "";
+// 并行缓存所有图片到 R2
+const cachedImages = await Promise.all(
+allImages.map((img, i) =>
+cacheImageToR2(img.url, `${collectionId}-${i}`, env)
+.then(url => ({
+url,
+title: img.caption || `图片 ${i + 1}`,
+description: img.caption || ‘’,
+}))
+)
+);
 
-      return {
-        id: pageId, // Use real UUID instead of index
-        displayId: index + 1, // Keep an incremental ID for display if needed
-        title,
-        location,
-        cover,
-        images,
-      };
-    });
+const collection = {
+id: collectionId,
+title: properties.Name?.title?.[0]?.plain_text || ‘Untitled’,
+subtitle: properties.Subtitle?.rich_text?.[0]?.plain_text || ‘’,
+location: properties.Location?.rich_text?.[0]?.plain_text || ‘’,
+year: properties.Year?.number || new Date().getFullYear(),
+description: properties.Description?.rich_text?.[0]?.plain_text || ‘’,
+count: cachedImages.length,
+cover: cachedImages[0]?.url || ‘’,
+images: cachedImages,
+};
 
-    // Create JSON Response
-    response = new Response(JSON.stringify(cleanData, null, 2), {
-      headers: {
-        "Content-Type": "application/json",
-        ...corsHeaders,
-        "Cache-Control": `public, max-age=${CACHE_TTL}, s-maxage=${CACHE_TTL}`,
-        "X-JSON-Cache": "MISS",
-      },
-    });
+// 存入缓存
+if (env.CACHE_KV) {
+await env.CACHE_KV.put(CACHE_KEY, JSON.stringify(collection), {
+expirationTtl: CACHE_TTL,
+});
+}
 
-    // Write JSON to Cache
-    ctx.waitUntil(cache.put(cacheKey, response.clone()));
-    return response;
+return jsonResponse(collection, {
+‘X-Cache’: ‘MISS’,
+‘Cache-Control’: `public, max-age=${CACHE_TTL}`,
+});
+}
 
-  } catch (err) {
-    return new Response(JSON.stringify({ error: err.message }), {
-      status: 500,
-      headers: { "Content-Type": "application/json", ...corsHeaders },
-    });
-  }
+// ============================================
+// 核心：缓存图片到 R2
+// ============================================
+
+async function cacheImageToR2(notionUrl, blockId, env) {
+if (!notionUrl || !env.PHOTO_BUCKET) {
+console.warn(‘⚠️ Missing URL or R2 bucket’);
+return notionUrl;
+}
+
+const r2Key = `images/${blockId}.jpg`;
+
+try {
+// 1. 检查 R2 是否已有此图片
+const existing = await env.PHOTO_BUCKET.head(r2Key);
+if (existing) {
+console.log(`✅ Image exists in R2: ${r2Key}`);
+return `${env.PUBLIC_URL || ''}/images/${blockId}.jpg`;
+}
+
+```
+console.log(`📥 Downloading image to R2: ${r2Key}`);
+
+// 2. 下载 Notion 图片
+const response = await fetch(notionUrl, {
+  headers: {
+    'User-Agent': 'Mozilla/5.0 (Cloudflare Worker)',
+  },
+});
+
+if (!response.ok) {
+  throw new Error(`Failed to fetch image: ${response.status}`);
+}
+
+// 3. 上传到 R2
+await env.PHOTO_BUCKET.put(r2Key, response.body, {
+  httpMetadata: {
+    contentType: response.headers.get('Content-Type') || 'image/jpeg',
+  },
+});
+
+console.log(`✅ Image cached to R2: ${r2Key}`);
+return `${env.PUBLIC_URL || ''}/images/${blockId}.jpg`;
+```
+
+} catch (error) {
+console.error(`❌ Failed to cache image to R2: ${r2Key}`, error);
+// 降级：返回原始 URL
+return notionUrl;
+}
+}
+
+// ============================================
+// Notion API 封装
+// ============================================
+
+async function notionQuery(databaseId, token) {
+const response = await fetch(
+`https://api.notion.com/v1/databases/${databaseId}/query`,
+{
+method: ‘POST’,
+headers: {
+‘Authorization’: `Bearer ${token}`,
+‘Notion-Version’: ‘2022-06-28’,
+‘Content-Type’: ‘application/json’,
+},
+body: JSON.stringify({
+page_size: 100,
+}),
+}
+);
+
+if (!response.ok) {
+throw new Error(`Notion API error: ${response.status}`);
+}
+
+return await response.json();
+}
+
+async function getPageInfo(pageId, token) {
+const response = await fetch(
+`https://api.notion.com/v1/pages/${pageId}`,
+{
+headers: {
+‘Authorization’: `Bearer ${token}`,
+‘Notion-Version’: ‘2022-06-28’,
+},
+}
+);
+
+if (!response.ok) {
+throw new Error(`Failed to fetch page info: ${response.status}`);
+}
+
+return await response.json();
+}
+
+async function getPageDetails(pageId, token) {
+const response = await fetch(
+`https://api.notion.com/v1/blocks/${pageId}/children?page_size=100`,
+{
+headers: {
+‘Authorization’: `Bearer ${token}`,
+‘Notion-Version’: ‘2022-06-28’,
+},
+}
+);
+
+if (!response.ok) {
+throw new Error(`Failed to fetch page details: ${response.status}`);
+}
+
+return await response.json();
+}
+
+// ============================================
+// 辅助函数
+// ============================================
+
+function extractImages(pageDetails) {
+if (!pageDetails?.results) return [];
+
+return pageDetails.results
+.filter(block => block.type === ‘image’)
+.map(block => ({
+url: block.image?.file?.url || block.image?.external?.url || ‘’,
+caption: block.image?.caption?.[0]?.plain_text || ‘’,
+}))
+.filter(img => img.url);
+}
+
+function jsonResponse(data, extraHeaders = {}) {
+return new Response(JSON.stringify(data), {
+headers: {
+‘Content-Type’: ‘application/json’,
+‘Access-Control-Allow-Origin’: ‘*’,
+…extraHeaders,
+},
+});
 }
