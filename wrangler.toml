@@ -16,7 +16,4 @@ binding = “CACHE_KV”
 id = “YOUR_KV_NAMESPACE_ID”
 
 
-[vars]
-PUBLIC_URL = “https://api.minzhangphoto.com”
-
 # ============================================
