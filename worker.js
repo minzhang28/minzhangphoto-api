@@ -3,7 +3,7 @@
 export default {
 async fetch(request, env) {
 // CORS handling
-if (request.method === “OPTIONS”) {
+if (request.method === "OPTIONS") {
 return new Response(null, {
 headers: {
 “Access-Control-Allow-Origin”: “*”,
