@@ -5,21 +5,18 @@ compatibility_date = "2025-12-20"
 [observability]
 enabled = true
 
-[vars]
-
-# 你的网站域名（用于生成图片 URL）
-
-PUBLIC_URL = “https://api.minzhangphoto.com” 
-
 
 [[r2_buckets]]
 binding = “PHOTO_BUCKET”
-bucket_name = “minzhang-photos”  
+bucket_name = “minzhang-photos”
 
 
 [[kv_namespaces]]
 binding = “CACHE_KV”
-id = “853a82a58ab340b3b32eaeacd5971feb” 
+id = “YOUR_KV_NAMESPACE_ID”
 
+
+[vars]
+PUBLIC_URL = “https://api.minzhangphoto.com”
 
 # ============================================
