@@ -81,11 +81,11 @@ async function handleCollections(env) {
   console.log("Cache miss, fetching from Notion...");
 
   // Query Notion database
-  const response = await notionQuery(env.NOTION_DATABASE_ID, env.NOTION_TOKEN);
+  const response = await notionQuery(env.NOTION_DATABASE_ID, env.NOTION_API_KEY);
 
   // Parallel fetch all page details
   const pageDetailsPromises = response.results.map(result =>
-    getPageDetails(result.id, env.NOTION_TOKEN).catch(err => {
+    getPageDetails(result.id, env.NOTION_API_KEY).catch(err => {
       console.error(`Failed to get page ${result.id}:`, err);
       return null;
     })
@@ -155,8 +155,8 @@ async function handleCollectionDetail(collectionId, env) {
 
   // Get Notion page
   const [pageInfo, pageDetails] = await Promise.all([
-    getPageInfo(collectionId, env.NOTION_TOKEN),
-    getPageDetails(collectionId, env.NOTION_TOKEN),
+    getPageInfo(collectionId, env.NOTION_API_KEY),
+    getPageDetails(collectionId, env.NOTION_API_KEY),
   ]);
 
   const properties = pageInfo.properties;
