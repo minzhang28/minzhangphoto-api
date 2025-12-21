@@ -83,26 +83,15 @@ async function handleCollections(env) {
   // Query Notion database
   const response = await notionQuery(env.NOTION_DATABASE_ID, env.NOTION_API_KEY);
 
-  // Parallel fetch all page details
-  const pageDetailsPromises = response.results.map(result =>
-    getPageDetails(result.id, env.NOTION_API_KEY).catch(err => {
-      console.error(`Failed to get page ${result.id}:`, err);
-      return null;
-    })
-  );
-
-  const allPageDetails = await Promise.all(pageDetailsPromises);
-
   // Process images in parallel to R2
   const collections = await Promise.all(
-    response.results.map(async (result, index) => {
-      const pageDetails = allPageDetails[index];
-      if (!pageDetails) return null;
-
+    response.results.map(async (result) => {
       const properties = result.properties;
       
       // Extract images from Database Property (not page content)
       const images = extractImagesFromProperty(properties);
+      
+      console.log(`[${result.id}] Found ${images.length} images`);
 
       // Cache all images to R2 in parallel
       const cachedImageUrls = await Promise.all(
@@ -264,15 +253,28 @@ async function notionQuery(databaseId, token) {
       },
       body: JSON.stringify({
         page_size: 100,
+        // No filter_properties - get all properties including Files
       }),
     }
   );
 
   if (!response.ok) {
+    const errorText = await response.text();
+    console.error("Notion API error:", response.status, errorText);
     throw new Error(`Notion API error: ${response.status}`);
   }
 
-  return await response.json();
+  const data = await response.json();
+  
+  // Debug: log first result's properties
+  if (data.results?.[0]) {
+    console.log("[DEBUG] First result property keys:", Object.keys(data.results[0].properties));
+    const imagesProp = data.results[0].properties.Images || data.results[0].properties.images;
+    console.log("[DEBUG] Images property type:", imagesProp?.type);
+    console.log("[DEBUG] Images has files:", !!imagesProp?.files);
+  }
+  
+  return data;
 }
 
 async function getPageInfo(pageId, token) {
@@ -313,15 +315,23 @@ async function getPageDetails(pageId, token) {
 
 // Helper functions
 function extractImagesFromProperty(properties) {
+  console.log("[DEBUG] Property keys:", Object.keys(properties));
+  
   // Try multiple possible field names (case-insensitive)
   const imageProp = properties.Images || properties.images || 
                     properties.Image || properties.image;
   
+  console.log("[DEBUG] Image property found:", !!imageProp);
+  console.log("[DEBUG] Has files:", !!imageProp?.files);
+  
   if (!imageProp || !imageProp.files) {
+    console.warn("[DEBUG] No image property or files found");
     return [];
   }
   
-  return imageProp.files
+  console.log("[DEBUG] Number of files:", imageProp.files.length);
+  
+  const urls = imageProp.files
     .map(item => {
       if (item.type === "file") {
         return item.file?.url || "";
@@ -331,6 +341,9 @@ function extractImagesFromProperty(properties) {
       return "";
     })
     .filter(Boolean);
+  
+  console.log("[DEBUG] Extracted URLs count:", urls.length);
+  return urls;
 }
 
 function extractImages(pageDetails) {
