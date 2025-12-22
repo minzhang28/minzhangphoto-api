@@ -1,5 +1,13 @@
+
 name = "api-minzhangphoto-com" 
 main = "worker.js"
 compatibility_date = "2025-12-20"
-[observability]
-enabled = true
+
+
+[[r2_buckets]]
+binding = "PHOTO_BUCKET"
+bucket_name = "minzhang-photos"
+
+[[kv_namespaces]]
+binding = "CACHE_KV"
+id = "853a82a58ab340b3b32eaeacd5971feb"

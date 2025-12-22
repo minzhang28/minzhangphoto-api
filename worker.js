@@ -1,205 +1,382 @@
-/**
- * Cloudflare Worker: Notion API Proxy + S3 Image Caching Gateway
- */
-export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
 
-    // --- Router Dispatch ---
-    // 1. If path is /image, handle image proxy logic (Aggressive Caching)
-    if (url.pathname === "/image") {
-      return handleImageProxy(request, ctx);
+// Optimized Cloudflare Worker with R2 Image Caching
+
+export default {
+  async fetch(request, env) {
+    // CORS handling
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type",
+        },
+      });
     }
 
-    // 2. Otherwise, default to Notion JSON logic (Short-term Caching)
-    return handleJsonRequest(request, env, ctx);
+    const url = new URL(request.url);
+
+    try {
+      // Routes
+      if (url.pathname === "/api/collections") {
+        return await handleCollections(env);
+      } else if (url.pathname.startsWith("/api/collection/")) {
+        const collectionId = url.pathname.split("/").pop();
+        return await handleCollectionDetail(collectionId, env);
+      } else if (url.pathname.startsWith("/images/")) {
+        // Serve images directly from R2
+        return await handleImageRequest(url.pathname, env);
+      }
+
+      return new Response("Not Found", { status: 404 });
+    } catch (error) {
+      console.error("Error:", error);
+      return new Response(JSON.stringify({ error: error.message }), {
+        status: 500,
+        headers: { 
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*",
+        },
+      });
+    }
   },
 };
 
-// ==========================================
-// Logic A: Image Proxy (Proxy & Smart Cache)
-// ==========================================
-async function handleImageProxy(request, ctx) {
-  const url = new URL(request.url);
-  const targetUrl = url.searchParams.get("url"); // The actual Notion S3 URL
-  const blockId = url.searchParams.get("blockId"); // Stable identifier (Notion Block/Page UUID)
-
-  // Validate parameters
-  if (!targetUrl || !blockId) {
-    return new Response("Missing 'url' or 'blockId' parameter", { status: 400 });
-  }
-
-  // 1. Check Cache (Cloudflare Edge Cache)
-  const cache = caches.default;
-
-  // [OPTIMIZATION]: Construct a stable Cache Key using blockId.
-  // We ignore the 'targetUrl' for caching because it contains expiring signatures.
-  // The cache key effectively becomes: https://api.domain.com/image/{UUID}
-  const cacheKey = new Request(new URL(`https://${url.hostname}/image/${blockId}`), request);
+// Handle image requests from R2
+async function handleImageRequest(pathname, env) {
+  const key = pathname.substring(1); // Remove leading /
   
-  let response = await cache.match(cacheKey);
-
-  if (response) {
-    const newRes = new Response(response.body, response);
-    newRes.headers.set("X-Image-Cache", "HIT");
-    // Ensure CORS headers are present even on cache hit
-    newRes.headers.set("Access-Control-Allow-Origin", "*");
-    return newRes;
-  }
-
-  // 2. Cache Miss: Fetch from Origin (Notion/S3)
-  const imageResponse = await fetch(targetUrl, {
-    headers: {
-      "User-Agent": "Cloudflare-Worker" // Polite behavior
+  try {
+    const object = await env.PHOTO_BUCKET.get(key);
+    
+    if (!object) {
+      return new Response("Image not found", { status: 404 });
     }
-  });
 
-  // If S3 link is expired or invalid, pass the error through
-  if (!imageResponse.ok) {
-    return imageResponse;
+    return new Response(object.body, {
+      headers: {
+        "Content-Type": object.httpMetadata?.contentType || "image/jpeg",
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "Access-Control-Allow-Origin": "*",
+      },
+    });
+  } catch (error) {
+    console.error("R2 error:", error);
+    return new Response("Error fetching image", { status: 500 });
   }
-
-  // 3. Header Cleaning & Reassembly
-  const newHeaders = new Headers(imageResponse.headers);
-
-  // Remove restrictive S3 headers
-  newHeaders.delete("x-amz-request-id");
-  newHeaders.delete("x-amz-id-2");
-  newHeaders.delete("set-cookie"); 
-  newHeaders.delete("expires");
-  
-  // Force Cache-Control
-  // Browser: 1 year (immutable) - The browser will never ask again for this URL
-  // Cloudflare Edge: 1 year (s-maxage)
-  newHeaders.set("Cache-Control", "public, max-age=31536000, s-maxage=31536000, immutable");
-  newHeaders.set("CDN-Cache-Control", "max-age=31536000");
-  newHeaders.set("X-Image-Cache", "MISS");
-  newHeaders.set("Access-Control-Allow-Origin", "*"); // Enable CORS
-
-  // 4. Rebuild Response and Write to Cache
-  response = new Response(imageResponse.body, {
-    status: imageResponse.status,
-    statusText: imageResponse.statusText,
-    headers: newHeaders,
-  });
-
-  // Write to cache using the STABLE cacheKey (based on blockId)
-  ctx.waitUntil(cache.put(cacheKey, response.clone()));
-
-  return response;
 }
 
-// ==========================================
-// Logic B: Notion JSON Data Aggregation
-// ==========================================
-async function handleJsonRequest(request, env, ctx) {
-  const CACHE_TTL = 60; // Cache JSON for only 60 seconds to ensure freshness
-  const corsHeaders = {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
-  };
+// Get all collections (optimized)
+async function handleCollections(env) {
+  const CACHE_KEY = "collections:all:v2";
+  const CACHE_TTL = 300; // 5 minutes
 
-  // Handle CORS preflight
-  if (request.method === "OPTIONS") {
-    return new Response(null, { headers: corsHeaders });
+  // Check KV cache
+  const cached = await env.CACHE_KV?.get(CACHE_KEY, "json");
+  if (cached) {
+    console.log("Cache hit for collections");
+    return jsonResponse(cached, { "X-Cache": "HIT" });
   }
 
+  console.log("Cache miss, fetching from Notion...");
+
+  // Query Notion database
+  const response = await notionQuery(env.NOTION_DATABASE_ID, env.NOTION_API_KEY);
+
+  // Process images in parallel to R2
+  const collections = await Promise.all(
+    response.results.map(async (result) => {
+      const properties = result.properties;
+      
+      // Extract images from Database Property (not page content)
+      const images = extractImagesFromProperty(properties);
+      
+      console.log(`[${result.id}] Found ${images.length} images`);
+
+      // Cache all images to R2 in parallel
+      const cachedImageUrls = await Promise.all(
+        images.slice(0, 4).map((imgUrl, i) => 
+          cacheImageToR2(imgUrl, `${result.id}-${i}`, env)
+        )
+      );
+
+      const validImages = cachedImageUrls.filter(Boolean);
+
+      return {
+        id: result.id,
+        title: properties.Name?.title?.[0]?.plain_text || "Untitled",
+        subtitle: properties.Subtitle?.rich_text?.[0]?.plain_text || "",
+        location: properties.Location?.rich_text?.[0]?.plain_text || "",
+        year: properties.Year?.number || new Date().getFullYear(),
+        description: properties.Description?.rich_text?.[0]?.plain_text || "",
+        count: images.length,
+        cover: validImages[0] || "",
+        previewImages: validImages.slice(0, 3),
+      };
+    })
+  );
+
+  const validCollections = collections.filter(Boolean);
+
+  // Store in KV cache
+  if (env.CACHE_KV) {
+    await env.CACHE_KV.put(CACHE_KEY, JSON.stringify(validCollections), {
+      expirationTtl: CACHE_TTL,
+    });
+  }
+
+  return jsonResponse(validCollections, { 
+    "X-Cache": "MISS",
+    "Cache-Control": `public, max-age=${CACHE_TTL}`,
+  });
+}
+
+// Get single collection detail
+async function handleCollectionDetail(collectionId, env) {
+  const CACHE_KEY = `collection:${collectionId}:v2`;
+  const CACHE_TTL = 600; // 10 minutes
+
+  // Check cache
+  const cached = await env.CACHE_KV?.get(CACHE_KEY, "json");
+  if (cached) {
+    console.log(`Cache hit for collection ${collectionId}`);
+    return jsonResponse(cached, { "X-Cache": "HIT" });
+  }
+
+  console.log(`Cache miss for collection ${collectionId}`);
+
+  // Get Notion page
+  const [pageInfo, pageDetails] = await Promise.all([
+    getPageInfo(collectionId, env.NOTION_API_KEY),
+    getPageDetails(collectionId, env.NOTION_API_KEY),
+  ]);
+
+  const properties = pageInfo.properties;
+  
+  // Extract images from Database Property
+  const allImageUrls = extractImagesFromProperty(properties);
+
+  // Cache all images to R2 in parallel
+  const cachedImages = await Promise.all(
+    allImageUrls.map((imgUrl, i) => 
+      cacheImageToR2(imgUrl, `${collectionId}-${i}`, env)
+        .then(url => ({
+          url,
+          title: `Image ${i + 1}`,
+          description: "",
+        }))
+    )
+  );
+
+  const collection = {
+    id: collectionId,
+    title: properties.Name?.title?.[0]?.plain_text || "Untitled",
+    subtitle: properties.Subtitle?.rich_text?.[0]?.plain_text || "",
+    location: properties.Location?.rich_text?.[0]?.plain_text || "",
+    year: properties.Year?.number || new Date().getFullYear(),
+    description: properties.Description?.rich_text?.[0]?.plain_text || "",
+    count: cachedImages.length,
+    cover: cachedImages[0]?.url || "",
+    images: cachedImages,
+  };
+
+  // Store in cache
+  if (env.CACHE_KV) {
+    await env.CACHE_KV.put(CACHE_KEY, JSON.stringify(collection), {
+      expirationTtl: CACHE_TTL,
+    });
+  }
+
+  return jsonResponse(collection, { 
+    "X-Cache": "MISS",
+    "Cache-Control": `public, max-age=${CACHE_TTL}`,
+  });
+}
+
+// Core function: Cache image to R2
+async function cacheImageToR2(notionUrl, blockId, env) {
+  if (!notionUrl || !env.PHOTO_BUCKET) {
+    console.warn("Missing URL or R2 bucket");
+    return notionUrl;
+  }
+
+  const r2Key = `images/${blockId}.jpg`;
+  
   try {
-    const cache = caches.default;
-    const cacheUrl = new URL(request.url);
-    const cacheKey = new Request(cacheUrl.toString(), request);
-
-    // Check JSON Cache
-    let response = await cache.match(cacheKey);
-    if (response) {
-      const newRes = new Response(response.body, response);
-      newRes.headers.set("X-JSON-Cache", "HIT");
-      return newRes;
+    // Check if image exists in R2
+    const existing = await env.PHOTO_BUCKET.head(r2Key);
+    if (existing) {
+      console.log(`Image exists in R2: ${r2Key}`);
+      return `${env.PUBLIC_URL || ""}/images/${blockId}.jpg`;
     }
 
-    if (!env.NOTION_API_KEY || !env.NOTION_DATABASE_ID) {
-      throw new Error("Missing environment variables");
+    console.log(`Downloading image to R2: ${r2Key}`);
+
+    // Download Notion image
+    const response = await fetch(notionUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Cloudflare Worker)",
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch image: ${response.status}`);
     }
 
-    // Fetch from Notion API
-    const notionUrl = `https://api.notion.com/v1/databases/${env.NOTION_DATABASE_ID}/query`;
-    const notionResponse = await fetch(notionUrl, {
+    // Upload to R2
+    await env.PHOTO_BUCKET.put(r2Key, response.body, {
+      httpMetadata: {
+        contentType: response.headers.get("Content-Type") || "image/jpeg",
+      },
+    });
+
+    console.log(`Image cached to R2: ${r2Key}`);
+    return `${env.PUBLIC_URL || ""}/images/${blockId}.jpg`;
+
+  } catch (error) {
+    console.error(`Failed to cache image to R2: ${r2Key}`, error);
+    // Fallback: return original URL
+    return notionUrl;
+  }
+}
+
+// Notion API wrappers
+async function notionQuery(databaseId, token) {
+  const response = await fetch(
+    `https://api.notion.com/v1/databases/${databaseId}/query`,
+    {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${env.NOTION_API_KEY}`,
+        "Authorization": `Bearer ${token}`,
         "Notion-Version": "2022-06-28",
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        sorts: [{ property: "SortOrder", direction: "ascending" }],
+        page_size: 100,
+        // No filter_properties - get all properties including Files
       }),
-    });
-
-    if (!notionResponse.ok) {
-      throw new Error(`Notion API Error: ${notionResponse.status}`);
     }
+  );
 
-    const data = await notionResponse.json();
-    const workerOrigin = new URL(request.url).origin; // e.g. https://api.minzhangphoto.com
-
-    // --- ETL Data Transformation ---
-    const cleanData = data.results.map((page, index) => {
-      const props = page.properties;
-      const pageId = page.id; // Stable UUID from Notion
-      
-      const getName = (p) => p?.title?.[0]?.plain_text || "Untitled";
-      const getText = (p) => p?.rich_text?.[0]?.plain_text || "";
-
-      // [Updated]: URL Rewrite Logic
-      const getImages = (prop) => {
-        if (!prop || !prop.files) return [];
-        return prop.files.map((item) => {
-          let rawUrl = null;
-          if (item.type === 'file') rawUrl = item.file.url;
-          else if (item.type === 'external') rawUrl = item.external.url;
-          
-          if (!rawUrl) return null;
-
-          // *CORE CHANGE*: Wrap S3 URL into Worker Proxy URL with blockId
-          // Result: https://api.../image?url=encodedUrl&blockId=UUID
-          return `${workerOrigin}/image?url=${encodeURIComponent(rawUrl)}&blockId=${pageId}`;
-        }).filter(Boolean);
-      };
-
-      const title = getName(props.name || props.Name);
-      const location = getText(props.Location || props.location);
-      const images = getImages(props.images || props.Images);
-      const cover = images.length > 0 ? images[0] : "";
-
-      return {
-        id: pageId, // Use real UUID instead of index
-        displayId: index + 1, // Keep an incremental ID for display if needed
-        title,
-        location,
-        cover,
-        images,
-      };
-    });
-
-    // Create JSON Response
-    response = new Response(JSON.stringify(cleanData, null, 2), {
-      headers: {
-        "Content-Type": "application/json",
-        ...corsHeaders,
-        "Cache-Control": `public, max-age=${CACHE_TTL}, s-maxage=${CACHE_TTL}`,
-        "X-JSON-Cache": "MISS",
-      },
-    });
-
-    // Write JSON to Cache
-    ctx.waitUntil(cache.put(cacheKey, response.clone()));
-    return response;
-
-  } catch (err) {
-    return new Response(JSON.stringify({ error: err.message }), {
-      status: 500,
-      headers: { "Content-Type": "application/json", ...corsHeaders },
-    });
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error("Notion API error:", response.status, errorText);
+    throw new Error(`Notion API error: ${response.status}`);
   }
+
+  const data = await response.json();
+  
+  // Debug: log first result's properties
+  if (data.results?.[0]) {
+    console.log("[DEBUG] First result property keys:", Object.keys(data.results[0].properties));
+    const imagesProp = data.results[0].properties.Images || data.results[0].properties.images;
+    console.log("[DEBUG] Images property type:", imagesProp?.type);
+    console.log("[DEBUG] Images has files:", !!imagesProp?.files);
+  }
+  
+  return data;
 }
+
+async function getPageInfo(pageId, token) {
+  const response = await fetch(
+    `https://api.notion.com/v1/pages/${pageId}`,
+    {
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Notion-Version": "2022-06-28",
+      },
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(`Failed to fetch page info: ${response.status}`);
+  }
+
+  return await response.json();
+}
+
+async function getPageDetails(pageId, token) {
+  const response = await fetch(
+    `https://api.notion.com/v1/blocks/${pageId}/children?page_size=100`,
+    {
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Notion-Version": "2022-06-28",
+      },
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(`Failed to fetch page details: ${response.status}`);
+  }
+
+  return await response.json();
+}
+
+// Helper functions
+function extractImagesFromProperty(properties) {
+  console.log("[DEBUG] Property keys:", Object.keys(properties));
+  
+  // Try multiple possible field names (case-insensitive)
+  const imageProp = properties.Images || properties.images || 
+                    properties.Image || properties.image;
+  
+  console.log("[DEBUG] Image property found:", !!imageProp);
+  console.log("[DEBUG] Has files:", !!imageProp?.files);
+  
+  if (!imageProp || !imageProp.files) {
+    console.warn("[DEBUG] No image property or files found");
+    return [];
+  }
+  
+  console.log("[DEBUG] Number of files:", imageProp.files.length);
+  
+  const urls = imageProp.files
+    .map(item => {
+      if (item.type === "file") {
+        return item.file?.url || "";
+      } else if (item.type === "external") {
+        return item.external?.url || "";
+      }
+      return "";
+    })
+    .filter(Boolean);
+  
+  console.log("[DEBUG] Extracted URLs count:", urls.length);
+  return urls;
+}
+
+function extractImages(pageDetails) {
+  if (!pageDetails?.results) return [];
+  
+  return pageDetails.results
+    .filter(block => block.type === "image")
+    .map(block => {
+      // Support both file and external image types
+      const imageData = block.image;
+      let url = "";
+      
+      if (imageData?.file?.url) {
+        url = imageData.file.url;
+      } else if (imageData?.external?.url) {
+        url = imageData.external.url;
+      }
+      
+      return {
+        url: url,
+        caption: imageData?.caption?.[0]?.plain_text || "",
+      };
+    })
+    .filter(img => img.url);
+}
+
+function jsonResponse(data, extraHeaders = {}) {
+  return new Response(JSON.stringify(data), {
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      ...extraHeaders,
+    },
+  });
+}
+
