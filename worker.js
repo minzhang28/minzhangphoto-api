@@ -96,7 +96,7 @@ async function handleCollections(env) {
 
       // Cache all images to R2 in parallel
       const cachedImageUrls = await Promise.all(
-        images.slice(0, 4).map((imgUrl) => {
+        images.map((imgUrl) => {
           // Extract stable file ID from Notion S3 URL
           const fileId = extractFileId(imgUrl);
           return cacheImageToR2(imgUrl, fileId, env);
@@ -115,7 +115,7 @@ async function handleCollections(env) {
         sortOrder: getSortOrder(properties),
         count: images.length,
         cover: validImages[0] || "",
-        previewImages: validImages.slice(0, 3),
+        previewImages: validImages,
       };
     })
   );
