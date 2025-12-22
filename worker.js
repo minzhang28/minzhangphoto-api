@@ -112,6 +112,7 @@ async function handleCollections(env) {
         location: properties.Location?.rich_text?.[0]?.plain_text || "",
         year: properties.Year?.number || new Date().getFullYear(),
         description: properties.Description?.rich_text?.[0]?.plain_text || "",
+        sortOrder: properties.SortOrder?.number || 0,
         count: images.length,
         cover: validImages[0] || "",
         previewImages: validImages.slice(0, 3),
@@ -179,6 +180,7 @@ async function handleCollectionDetail(collectionId, env) {
     location: properties.Location?.rich_text?.[0]?.plain_text || "",
     year: properties.Year?.number || new Date().getFullYear(),
     description: properties.Description?.rich_text?.[0]?.plain_text || "",
+    sortOrder: properties.SortOrder?.number || 0,
     count: cachedImages.length,
     cover: cachedImages[0]?.url || "",
     images: cachedImages,
@@ -289,6 +291,12 @@ async function notionQuery(databaseId, token) {
       },
       body: JSON.stringify({
         page_size: 100,
+        sorts: [
+          {
+            property: "SortOrder",
+            direction: "ascending"
+          }
+        ],
         // No filter_properties - get all properties including Files
       }),
     }
