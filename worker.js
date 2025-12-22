@@ -20,18 +20,6 @@ export default {
       // Routes
       if (url.pathname === "/api/collections") {
         return await handleCollections(env);
-      } else if (url.pathname === "/api/test-r2") {
-        // Test endpoint to verify R2 binding
-        return new Response(JSON.stringify({
-          r2_bound: !!env.PHOTO_BUCKET,
-          kv_bound: !!env.CACHE_KV,
-          public_url: env.PUBLIC_URL || "not set"
-        }), {
-          headers: { 
-            "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*"
-          }
-        });
       } else if (url.pathname.startsWith("/api/collection/")) {
         const collectionId = url.pathname.split("/").pop();
         return await handleCollectionDetail(collectionId, env);
