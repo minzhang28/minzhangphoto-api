@@ -279,7 +279,22 @@ async function cacheImageToR2(notionUrl, blockId, env, retries = 2) {
 }
 
 // Notion API wrappers
-async function notionQuery(databaseId, token) {
+async function notionQuery(databaseId, token, includeSorts = true) {
+  const requestBody = {
+    page_size: 100,
+    // No filter_properties - get all properties including Files
+  };
+
+  // Add sorts if requested (can be disabled if SortOrder property doesn't exist)
+  if (includeSorts) {
+    requestBody.sorts = [
+      {
+        property: "SortOrder",
+        direction: "ascending"
+      }
+    ];
+  }
+
   const response = await fetch(
     `https://api.notion.com/v1/databases/${databaseId}/query`,
     {
@@ -289,16 +304,7 @@ async function notionQuery(databaseId, token) {
         "Notion-Version": "2022-06-28",
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        page_size: 100,
-        sorts: [
-          {
-            property: "SortOrder",
-            direction: "ascending"
-          }
-        ],
-        // No filter_properties - get all properties including Files
-      }),
+      body: JSON.stringify(requestBody),
     }
   );
 
