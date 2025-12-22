@@ -112,7 +112,7 @@ async function handleCollections(env) {
         location: properties.Location?.rich_text?.[0]?.plain_text || "",
         year: properties.Year?.number || new Date().getFullYear(),
         description: properties.Description?.rich_text?.[0]?.plain_text || "",
-        sortOrder: properties.SortOrder?.number || 0,
+        sortOrder: getSortOrder(properties),
         count: images.length,
         cover: validImages[0] || "",
         previewImages: validImages.slice(0, 3),
@@ -180,7 +180,7 @@ async function handleCollectionDetail(collectionId, env) {
     location: properties.Location?.rich_text?.[0]?.plain_text || "",
     year: properties.Year?.number || new Date().getFullYear(),
     description: properties.Description?.rich_text?.[0]?.plain_text || "",
-    sortOrder: properties.SortOrder?.number || 0,
+    sortOrder: getSortOrder(properties),
     count: cachedImages.length,
     cover: cachedImages[0]?.url || "",
     images: cachedImages,
@@ -364,6 +364,13 @@ async function getPageDetails(pageId, token) {
 }
 
 // Helper functions
+function getSortOrder(properties) {
+  // Try multiple possible property names for sort order
+  const sortProp = properties.SortOrder || properties['Sort Order'] ||
+                   properties.sortOrder || properties.Order || properties.order;
+  return sortProp?.number || 0;
+}
+
 function extractImagesFromProperty(properties) {
   console.log("[DEBUG] Property keys:", Object.keys(properties));
   
