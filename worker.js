@@ -1,5 +1,6 @@
 
 // Optimized Cloudflare Worker with R2 Image Caching
+// Fixes: deadlock prevention, stable file IDs, proper error handling
 
 export default {
   async fetch(request, env) {
@@ -96,9 +97,9 @@ async function handleCollections(env) {
       // Cache all images to R2 in parallel
       const cachedImageUrls = await Promise.all(
         images.slice(0, 4).map((imgUrl) => {
-          // Generate stable ID from URL hash
-          const urlHash = simpleHash(imgUrl);
-          return cacheImageToR2(imgUrl, `${result.id}-${urlHash}`, env);
+          // Extract stable file ID from Notion S3 URL
+          const fileId = extractFileId(imgUrl);
+          return cacheImageToR2(imgUrl, fileId, env);
         })
       );
 
@@ -161,11 +162,11 @@ async function handleCollectionDetail(collectionId, env) {
   // Cache all images to R2 in parallel
   const cachedImages = await Promise.all(
     allImageUrls.map((imgUrl) => {
-      const urlHash = simpleHash(imgUrl);
-      return cacheImageToR2(imgUrl, `${collectionId}-${urlHash}`, env)
+      const fileId = extractFileId(imgUrl);
+      return cacheImageToR2(imgUrl, fileId, env)
         .then(url => ({
           url,
-          title: `Image ${urlHash.substring(0, 6)}`,
+          title: `Image`,
           description: "",
         }));
     })
@@ -196,8 +197,8 @@ async function handleCollectionDetail(collectionId, env) {
   });
 }
 
-// Core function: Cache image to R2
-async function cacheImageToR2(notionUrl, blockId, env) {
+// Core function: Cache image to R2 with deadlock prevention
+async function cacheImageToR2(notionUrl, blockId, env, retries = 2) {
   if (!notionUrl || !env.PHOTO_BUCKET) {
     console.warn("Missing URL or R2 bucket");
     return notionUrl;
@@ -205,25 +206,57 @@ async function cacheImageToR2(notionUrl, blockId, env) {
 
   const r2Key = `images/${blockId}.jpg`;
   
+  // Check if image exists in R2 using get() with proper cleanup
   try {
-    // Check if image exists in R2
-    const existing = await env.PHOTO_BUCKET.head(r2Key);
-    if (existing) {
+    const existing = await env.PHOTO_BUCKET.get(r2Key);
+    if (existing !== null) {
       console.log(`Image exists in R2: ${r2Key}`);
-      return `${env.PUBLIC_URL || ""}/images/${blockId}.jpg`;
+      // CRITICAL: Cancel the body to prevent deadlock
+      await existing.body?.cancel();
+      return `/images/${blockId}.jpg`;
     }
+  } catch (error) {
+    // File doesn't exist or error checking, continue to download
+    console.log(`Image not in R2, will download: ${r2Key}`);
+  }
 
+  try {
     console.log(`Downloading image to R2: ${r2Key}`);
 
-    // Download Notion image
-    const response = await fetch(notionUrl, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Cloudflare Worker)",
-      },
-    });
+    // Download Notion image with retry
+    let response;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        response = await fetch(notionUrl, {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Cloudflare Worker)",
+          },
+          signal: AbortSignal.timeout(10000), // 10 second timeout
+        });
+        
+        if (response.ok) {
+          break; // Success, exit retry loop
+        }
+        
+        // CRITICAL: Cancel failed response body to avoid deadlock
+        await response.body?.cancel();
+        
+        if (attempt < retries) {
+          console.warn(`Download attempt ${attempt + 1} failed: ${response.status}, retrying...`);
+          await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+        }
+      } catch (err) {
+        if (attempt < retries) {
+          console.warn(`Download attempt ${attempt + 1} error: ${err.message}, retrying...`);
+          await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+        } else {
+          throw err;
+        }
+      }
+    }
 
-    if (!response.ok) {
-      throw new Error(`Failed to fetch image: ${response.status}`);
+    if (!response || !response.ok) {
+      throw new Error(`Failed to fetch image after ${retries + 1} attempts: ${response?.status}`);
     }
 
     // Upload to R2
@@ -234,10 +267,10 @@ async function cacheImageToR2(notionUrl, blockId, env) {
     });
 
     console.log(`Image cached to R2: ${r2Key}`);
-    return `${env.PUBLIC_URL || ""}/images/${blockId}.jpg`;
+    return `/images/${blockId}.jpg`;
 
   } catch (error) {
-    console.error(`Failed to cache image to R2: ${r2Key}`, error);
+    console.error(`Failed to cache image to R2: ${r2Key}`, error.message);
     // Fallback: return original URL
     return notionUrl;
   }
@@ -392,5 +425,29 @@ function simpleHash(str) {
     hash = hash & hash; // Convert to 32bit integer
   }
   return Math.abs(hash).toString(36).substring(0, 8);
+}
+
+// Extract stable file ID from Notion S3 URL
+function extractFileId(url) {
+  try {
+    // Notion S3 URL format:
+    // https://prod-files-secure.s3.us-west-2.amazonaws.com/workspace-id/FILE-ID/filename.jpg?signature...
+    const urlObj = new URL(url);
+    const pathParts = urlObj.pathname.split('/').filter(Boolean);
+    
+    if (pathParts.length >= 2) {
+      // Use the file UUID (second-to-last part of path)
+      const fileId = pathParts[pathParts.length - 2];
+      // Clean up the file ID (remove any non-alphanumeric chars except dash)
+      return fileId.replace(/[^a-zA-Z0-9-]/g, '');
+    }
+    
+    // Fallback: use hash of the base URL (without query params)
+    const baseUrl = `${urlObj.origin}${urlObj.pathname}`;
+    return simpleHash(baseUrl);
+  } catch (error) {
+    // If URL parsing fails, use hash
+    return simpleHash(url);
+  }
 }
 
