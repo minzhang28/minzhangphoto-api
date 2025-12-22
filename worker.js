@@ -96,7 +96,7 @@ async function handleCollections(env) {
 
       // Cache all images to R2 in parallel
       const cachedImageUrls = await Promise.all(
-        images.slice(0, 4).map((imgUrl) => {
+        images.map((imgUrl) => {
           // Extract stable file ID from Notion S3 URL
           const fileId = extractFileId(imgUrl);
           return cacheImageToR2(imgUrl, fileId, env);
@@ -112,9 +112,10 @@ async function handleCollections(env) {
         location: properties.Location?.rich_text?.[0]?.plain_text || "",
         year: properties.Year?.number || new Date().getFullYear(),
         description: properties.Description?.rich_text?.[0]?.plain_text || "",
+        sortOrder: getSortOrder(properties),
         count: images.length,
         cover: validImages[0] || "",
-        previewImages: validImages.slice(0, 3),
+        previewImages: validImages,
       };
     })
   );
@@ -179,6 +180,7 @@ async function handleCollectionDetail(collectionId, env) {
     location: properties.Location?.rich_text?.[0]?.plain_text || "",
     year: properties.Year?.number || new Date().getFullYear(),
     description: properties.Description?.rich_text?.[0]?.plain_text || "",
+    sortOrder: getSortOrder(properties),
     count: cachedImages.length,
     cover: cachedImages[0]?.url || "",
     images: cachedImages,
@@ -277,7 +279,22 @@ async function cacheImageToR2(notionUrl, blockId, env, retries = 2) {
 }
 
 // Notion API wrappers
-async function notionQuery(databaseId, token) {
+async function notionQuery(databaseId, token, includeSorts = true) {
+  const requestBody = {
+    page_size: 100,
+    // No filter_properties - get all properties including Files
+  };
+
+  // Add sorts if requested (can be disabled if SortOrder property doesn't exist)
+  if (includeSorts) {
+    requestBody.sorts = [
+      {
+        property: "SortOrder",
+        direction: "ascending"
+      }
+    ];
+  }
+
   const response = await fetch(
     `https://api.notion.com/v1/databases/${databaseId}/query`,
     {
@@ -287,10 +304,7 @@ async function notionQuery(databaseId, token) {
         "Notion-Version": "2022-06-28",
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        page_size: 100,
-        // No filter_properties - get all properties including Files
-      }),
+      body: JSON.stringify(requestBody),
     }
   );
 
@@ -350,6 +364,13 @@ async function getPageDetails(pageId, token) {
 }
 
 // Helper functions
+function getSortOrder(properties) {
+  // Try multiple possible property names for sort order
+  const sortProp = properties.SortOrder || properties['Sort Order'] ||
+                   properties.sortOrder || properties.Order || properties.order;
+  return sortProp?.number || 0;
+}
+
 function extractImagesFromProperty(properties) {
   console.log("[DEBUG] Property keys:", Object.keys(properties));
   
