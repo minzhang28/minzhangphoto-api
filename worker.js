@@ -20,6 +20,18 @@ export default {
       // Routes
       if (url.pathname === "/api/collections") {
         return await handleCollections(env);
+      } else if (url.pathname === "/api/test-r2") {
+        // Test endpoint to verify R2 binding
+        return new Response(JSON.stringify({
+          r2_bound: !!env.PHOTO_BUCKET,
+          kv_bound: !!env.CACHE_KV,
+          public_url: env.PUBLIC_URL || "not set"
+        }), {
+          headers: { 
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*"
+          }
+        });
       } else if (url.pathname.startsWith("/api/collection/")) {
         const collectionId = url.pathname.split("/").pop();
         return await handleCollectionDetail(collectionId, env);
@@ -95,9 +107,11 @@ async function handleCollections(env) {
 
       // Cache all images to R2 in parallel
       const cachedImageUrls = await Promise.all(
-        images.slice(0, 4).map((imgUrl, i) => 
-          cacheImageToR2(imgUrl, `${result.id}-${i}`, env)
-        )
+        images.slice(0, 4).map((imgUrl) => {
+          // Generate stable ID from URL hash
+          const urlHash = simpleHash(imgUrl);
+          return cacheImageToR2(imgUrl, `${result.id}-${urlHash}`, env);
+        })
       );
 
       const validImages = cachedImageUrls.filter(Boolean);
@@ -158,14 +172,15 @@ async function handleCollectionDetail(collectionId, env) {
 
   // Cache all images to R2 in parallel
   const cachedImages = await Promise.all(
-    allImageUrls.map((imgUrl, i) => 
-      cacheImageToR2(imgUrl, `${collectionId}-${i}`, env)
+    allImageUrls.map((imgUrl) => {
+      const urlHash = simpleHash(imgUrl);
+      return cacheImageToR2(imgUrl, `${collectionId}-${urlHash}`, env)
         .then(url => ({
           url,
-          title: `Image ${i + 1}`,
+          title: `Image ${urlHash.substring(0, 6)}`,
           description: "",
-        }))
-    )
+        }));
+    })
   );
 
   const collection = {
@@ -378,5 +393,16 @@ function jsonResponse(data, extraHeaders = {}) {
       ...extraHeaders,
     },
   });
+}
+
+// Simple hash function for generating stable IDs
+function simpleHash(str) {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash; // Convert to 32bit integer
+  }
+  return Math.abs(hash).toString(36).substring(0, 8);
 }
 
