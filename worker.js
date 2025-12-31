@@ -25,8 +25,8 @@ export default {
         const collectionId = url.pathname.split("/").pop();
         return await handleCollectionDetail(collectionId, env);
       } else if (url.pathname.startsWith("/images/")) {
-        // Serve images directly from R2
-        return await handleImageRequest(url.pathname, env);
+        // Serve images directly from R2 (with optional resizing)
+        return await handleImageRequest(url.pathname, env, request);
       }
 
       return new Response("Not Found", { status: 404 });
@@ -43,17 +43,51 @@ export default {
   },
 };
 
-// Handle image requests from R2
-async function handleImageRequest(pathname, env) {
+// Handle image requests from R2 with optional resizing
+async function handleImageRequest(pathname, env, request) {
   const key = pathname.substring(1); // Remove leading /
-  
+  const url = new URL(request.url);
+  const width = url.searchParams.get('width');
+  const quality = url.searchParams.get('quality') || '85';
+
   try {
     const object = await env.PHOTO_BUCKET.get(key);
-    
+
     if (!object) {
       return new Response("Image not found", { status: 404 });
     }
 
+    // If width parameter is provided, attempt to resize
+    if (width && parseInt(width) > 0) {
+      try {
+        // Use Cloudflare's image resizing on the fly
+        const resizedResponse = await fetch(request.url.split('?')[0], {
+          cf: {
+            image: {
+              width: parseInt(width),
+              quality: parseInt(quality),
+              format: 'auto'  // Auto WebP/AVIF for supported browsers
+            }
+          }
+        });
+
+        if (resizedResponse.ok) {
+          return new Response(resizedResponse.body, {
+            headers: {
+              "Content-Type": resizedResponse.headers.get("Content-Type") || "image/jpeg",
+              "Cache-Control": "public, max-age=31536000, immutable",
+              "Access-Control-Allow-Origin": "*",
+              "X-Resized": "true"
+            },
+          });
+        }
+      } catch (resizeError) {
+        console.warn("Image resizing failed, serving original:", resizeError.message);
+        // Fall through to serve original if resizing fails
+      }
+    }
+
+    // Serve original image
     return new Response(object.body, {
       headers: {
         "Content-Type": object.httpMetadata?.contentType || "image/jpeg",
@@ -105,6 +139,13 @@ async function handleCollections(env) {
 
       const validImages = cachedImageUrls.filter(Boolean);
 
+      // Generate responsive image URLs
+      const responsiveImages = validImages.map(url => ({
+        small: `${url}?width=800`,
+        large: `${url}?width=2000`,
+        original: url
+      }));
+
       return {
         id: result.id,
         title: properties.Name?.title?.[0]?.plain_text || "Untitled",
@@ -114,8 +155,8 @@ async function handleCollections(env) {
         description: properties.Description?.rich_text?.[0]?.plain_text || "",
         sortOrder: getSortOrder(properties),
         count: images.length,
-        cover: validImages[0] || "",
-        previewImages: validImages,
+        cover: validImages[0] ? `${validImages[0]}?width=2000` : "",
+        previewImages: responsiveImages,
       };
     })
   );
@@ -166,7 +207,9 @@ async function handleCollectionDetail(collectionId, env) {
       const fileId = extractFileId(imgUrl);
       return cacheImageToR2(imgUrl, fileId, env)
         .then(url => ({
-          url,
+          small: `${url}?width=800`,
+          large: `${url}?width=2000`,
+          original: url,
           title: `Image`,
           description: "",
         }));
@@ -182,7 +225,7 @@ async function handleCollectionDetail(collectionId, env) {
     description: properties.Description?.rich_text?.[0]?.plain_text || "",
     sortOrder: getSortOrder(properties),
     count: cachedImages.length,
-    cover: cachedImages[0]?.url || "",
+    cover: cachedImages[0] ? `${cachedImages[0].original}?width=2000` : "",
     images: cachedImages,
   };
 
@@ -199,7 +242,7 @@ async function handleCollectionDetail(collectionId, env) {
   });
 }
 
-// Core function: Cache image to R2 with deadlock prevention
+// Core function: Cache image to R2 (on-demand resizing via URL params)
 async function cacheImageToR2(notionUrl, blockId, env, retries = 2) {
   if (!notionUrl || !env.PHOTO_BUCKET) {
     console.warn("Missing URL or R2 bucket");
@@ -207,7 +250,7 @@ async function cacheImageToR2(notionUrl, blockId, env, retries = 2) {
   }
 
   const r2Key = `images/${blockId}.jpg`;
-  
+
   // Check if image exists in R2 using get() with proper cleanup
   try {
     const existing = await env.PHOTO_BUCKET.get(r2Key);
@@ -235,14 +278,14 @@ async function cacheImageToR2(notionUrl, blockId, env, retries = 2) {
           },
           signal: AbortSignal.timeout(10000), // 10 second timeout
         });
-        
+
         if (response.ok) {
           break; // Success, exit retry loop
         }
-        
+
         // CRITICAL: Cancel failed response body to avoid deadlock
         await response.body?.cancel();
-        
+
         if (attempt < retries) {
           console.warn(`Download attempt ${attempt + 1} failed: ${response.status}, retrying...`);
           await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
