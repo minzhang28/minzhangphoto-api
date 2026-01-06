@@ -153,6 +153,7 @@ async function handleCollections(env) {
         location: properties.Location?.rich_text?.[0]?.plain_text || "",
         year: properties.Year?.number || new Date().getFullYear(),
         description: properties.Description?.rich_text?.[0]?.plain_text || "",
+        story: getStory(properties),
         sortOrder: getSortOrder(properties),
         count: images.length,
         cover: validImages[0] ? `${validImages[0]}?width=2000` : "",
@@ -223,6 +224,7 @@ async function handleCollectionDetail(collectionId, env) {
     location: properties.Location?.rich_text?.[0]?.plain_text || "",
     year: properties.Year?.number || new Date().getFullYear(),
     description: properties.Description?.rich_text?.[0]?.plain_text || "",
+    story: getStory(properties),
     sortOrder: getSortOrder(properties),
     count: cachedImages.length,
     cover: cachedImages[0] ? `${cachedImages[0].original}?width=2000` : "",
@@ -412,6 +414,12 @@ function getSortOrder(properties) {
   const sortProp = properties.SortOrder || properties['Sort Order'] ||
                    properties.sortOrder || properties.Order || properties.order;
   return sortProp?.number || 0;
+}
+
+function getStory(properties) {
+  // Try multiple possible property names for story
+  const storyProp = properties.Story || properties.story;
+  return storyProp?.rich_text?.[0]?.plain_text || "";
 }
 
 function extractImagesFromProperty(properties) {
