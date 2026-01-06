@@ -49,6 +49,7 @@ Returns a list of all photo collections.
     "location": "Location",
     "year": 2024,
     "description": "Full description",
+    "story": "The story behind this collection",
     "sortOrder": 1,
     "count": 24,
     "cover": "/images/file-id.jpg?width=2000",
@@ -85,6 +86,7 @@ Returns detailed information about a specific collection including all images.
   "location": "Location",
   "year": 2024,
   "description": "Full description",
+  "story": "The story behind this collection",
   "sortOrder": 1,
   "count": 24,
   "cover": "/images/file-id.jpg?width=2000",
@@ -205,6 +207,7 @@ Your Notion database should have these properties:
 | `Location` | Rich Text | Location where photos were taken |
 | `Year` | Number | Year of the collection |
 | `Description` | Rich Text | Full description |
+| `Story` | Rich Text | The story behind this collection |
 | `SortOrder` | Number | Display order (lower numbers appear first) |
 | `Images` | Files & Media | Photo files for the collection |
 
